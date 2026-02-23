@@ -1,178 +1,279 @@
-import streamlit as st
-import pandas as pd
-from datetime import datetime, timedelta
+# -*- coding: utf-8 -*-
 import io
+from datetime import datetime, date, timedelta
+import pandas as pd
+import streamlit as st
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import mm
 
-st.set_page_config(page_title="BuchEasy Demo", layout="wide")
+# =============================
+# PAGE CONFIG
+# =============================
+st.set_page_config(page_title="BuchEasy – DATEV Import", page_icon="🧾")
 
-st.title("📘 BuchEasy – Demo (7 Tage Version)")
-st.warning("⚠️ Demo-Version: Es werden nur die ersten 7 Tage der Shore-Datei berücksichtigt.")
+# =============================
+# KONFIG
+# =============================
+KONTO_RECHTS = "1000"
+GEGEN_UMSATZ = "8400"
+GEGEN_KARTE = "1360"
+GEGEN_BANK = "1360"
+WKZ = "EUR"
 
-# =====================================================
-# SESSION STATE
-# =====================================================
+# =============================
+# DEMO SETTINGS
+# =============================
+DEMO_MODE = True
+DEMO_DAYS = 7
 
-if "shore_data" not in st.session_state:
-    st.session_state.shore_data = None
+# =============================
+# Helper
+# =============================
+def money_de(x):
+    return f"{float(x):.2f}".replace(".", ",")
 
-if "einzahlungen" not in st.session_state:
-    st.session_state.einzahlungen = []
+def iso_week_key(d):
+    iso = d.isocalendar()
+    return (iso.year, iso.week)
 
-# =====================================================
-# SHORE IMPORT (XLSX)
-# =====================================================
+def belegdatum_ttmm(d):
+    return f"{d.day:02d}{d.month:02d}"
 
-st.header("📥 Shore Export importieren (.xlsx)")
+# =============================
+# Excel robust einlesen
+# =============================
+def read_excel_days(file_bytes):
 
-uploaded_file = st.file_uploader("Shore XLSX hochladen", type=["xlsx"])
+    df_raw = pd.read_excel(io.BytesIO(file_bytes), header=None, engine="openpyxl")
+    header_idx = None
 
-if uploaded_file:
-    try:
-        df = pd.read_excel(uploaded_file)
+    for i in range(min(len(df_raw), 60)):
+        row = [str(x).lower() for x in df_raw.iloc[i].tolist()]
+        if any("datum" in v for v in row):
+            header_idx = i
+            break
 
-        # WICHTIG:
-        # Falls deine Spalten anders heißen, hier anpassen
-        df["Datum"] = pd.to_datetime(df["Datum"], dayfirst=True)
+    if header_idx is None:
+        raise ValueError("Keine Kopfzeile mit 'Datum' gefunden.")
 
-        first_date = df["Datum"].min()
-        end_date = first_date + timedelta(days=6)
+    df = pd.read_excel(io.BytesIO(file_bytes), header=header_idx, engine="openpyxl")
 
-        df_demo = df[(df["Datum"] >= first_date) & (df["Datum"] <= end_date)]
+    def find_col(keys):
+        for col in df.columns:
+            for k in keys:
+                if k in str(col).lower():
+                    return col
+        return None
 
-        st.session_state.shore_data = df_demo
+    datum_col = find_col(["datum"])
+    umsatz_col = find_col(["brutto", "umsatz", "total", "betrag"])
+    zahlart_col = find_col(["zahlart", "payment", "art"])
 
-        st.success("Shore XLSX importiert (7 Tage gefiltert).")
+    if not datum_col or not umsatz_col:
+        raise ValueError("Spalten nicht erkannt.")
 
-    except Exception as e:
-        st.error(f"Importfehler: {e}")
+    df = df.rename(columns={datum_col: "Datum", umsatz_col: "Umsatz"})
+    if zahlart_col:
+        df = df.rename(columns={zahlart_col: "Zahlart"})
+    else:
+        df["Zahlart"] = ""
 
-# =====================================================
-# ANFANGSBESTAND
-# =====================================================
+    df["Datum"] = pd.to_datetime(df["Datum"], errors="coerce").dt.date
+    df = df[df["Datum"].notna()].copy()
+    df["Umsatz"] = pd.to_numeric(df["Umsatz"], errors="coerce").fillna(0.0)
 
-st.header("💰 Anfangsbestand Kasse")
+    def is_card(x):
+        x = str(x).lower()
+        return any(k in x for k in ["karte", "ec", "visa", "master", "shore"])
 
-anfangsbestand = st.number_input(
-    "Anfangsbestand (€)",
-    min_value=0.0,
-    step=0.01
-)
+    df["ist_karte"] = df["Zahlart"].apply(is_card)
 
-# =====================================================
-# EINZAHLUNG BANK
-# =====================================================
+    g_all = df.groupby("Datum")["Umsatz"].sum()
+    g_card = df[df["ist_karte"]].groupby("Datum")["Umsatz"].sum()
+
+    days = []
+    for d, total in g_all.items():
+        days.append((d, float(total), float(g_card.get(d, 0.0))))
+    days.sort(key=lambda x: x[0])
+
+    if not days:
+        raise ValueError("Keine Buchungsdaten gefunden.")
+
+    return days
+
+# =============================
+# DATEV Export
+# =============================
+def build_datev_csv(days, einzahl_rows):
+
+    rows = []
+
+    for d, u, k in days:
+        if u > 0:
+            rows.append([money_de(u), "S", KONTO_RECHTS, GEGEN_UMSATZ, belegdatum_ttmm(d)])
+        if k > 0:
+            rows.append([money_de(k), "H", KONTO_RECHTS, GEGEN_KARTE, belegdatum_ttmm(d)])
+
+    for item in einzahl_rows:
+        d_b = item["datum"]
+        if isinstance(d_b, datetime):
+            d_b = d_b.date()
+        rows.append([money_de(item["betrag"]), "S", KONTO_RECHTS, GEGEN_BANK, belegdatum_ttmm(d_b)])
+
+    out = io.StringIO()
+    out.write("Umsatz;S/H;Konto;Gegenkonto;Belegdatum\n")
+    for r in rows:
+        out.write(";".join(r) + "\n")
+
+    return out.getvalue().encode("utf-8")
+
+# =============================
+# PDF
+# =============================
+def build_pdf(von, bis, days, einzahl_rows, startbestand=0.0):
+
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
+
+    x_left = 18 * mm
+    y = height - 18 * mm
+
+    def euro_de(amount):
+        return f"{amount:,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
+
+    def page_break():
+        nonlocal y
+        if y < 20 * mm:
+            c.showPage()
+            y = height - 18 * mm
+
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(x_left, y, f"Kassenbuch {von.month:02d}.{von.year}")
+    y -= 8 * mm
+
+    c.setFont("Helvetica", 10)
+    c.drawString(x_left, y,
+                 f"Zeitraum: {von.strftime('%d.%m.%Y')} – {bis.strftime('%d.%m.%Y')}")
+    y -= 12 * mm
+
+    current_cash = startbestand
+
+    for d, u, k in days:
+
+        if u > 0:
+            c.drawString(x_left, y, f"{d.strftime('%d.%m.')} Umsatz")
+            c.drawRightString(width - 18 * mm, y, euro_de(u))
+            y -= 6 * mm
+            current_cash += u
+            page_break()
+
+        if k > 0:
+            c.drawString(x_left, y, f"{d.strftime('%d.%m.')} EC")
+            c.drawRightString(width - 18 * mm, y, euro_de(k))
+            y -= 6 * mm
+            current_cash -= k
+            page_break()
+
+    for item in einzahl_rows:
+        d_b = item["datum"]
+        if isinstance(d_b, datetime):
+            d_b = d_b.date()
+        betrag = float(item["betrag"])
+        if betrag > 0:
+            c.drawString(x_left, y,
+                         f"Einzahlung Bank {d_b.strftime('%d.%m.')}")
+            c.drawRightString(width - 18 * mm, y, euro_de(betrag))
+            y -= 6 * mm
+            current_cash -= betrag
+            page_break()
+
+    c.save()
+    return buf.getvalue()
+
+# =============================
+# UI
+# =============================
+st.title("📘 BuchEasy – DATEV Import in Sekunden")
+
+if DEMO_MODE:
+    st.warning("⚠️ Demo-Version: Es werden nur die ersten 7 Tage berücksichtigt.")
+
+st.divider()
+
+st.header("📥 Shore Export importieren")
+uploaded = st.file_uploader("Excel hochladen (.xlsx)", type=["xlsx"])
 
 st.header("🏦 Einzahlung Bank")
 
-with st.form("einzahlung_form"):
-    datum = st.date_input("Datum")
-    betrag = st.number_input("Betrag (€)", min_value=0.0, step=0.01)
-    speichern = st.form_submit_button("Speichern")
+if "einzahlungen" not in st.session_state:
+    st.session_state["einzahlungen"] = []
 
-    if speichern and betrag > 0:
-        st.session_state.einzahlungen.append({
-            "Datum": datum,
-            "Betrag": betrag
-        })
-        st.success("Einzahlung gespeichert")
+col1, col2 = st.columns(2)
+with col1:
+    d_in = st.date_input("Datum", date.today())
+with col2:
+    b_in = st.number_input("Betrag (€)", min_value=0.0, step=10.0)
 
-if st.session_state.einzahlungen:
-    df_einzahlung = pd.DataFrame(st.session_state.einzahlungen)
-    st.dataframe(df_einzahlung, use_container_width=True)
-
-# =====================================================
-# KASSENBUCH
-# =====================================================
-
-if st.session_state.shore_data is not None:
-
-    st.header("📋 Kassenbuch")
-
-    df = st.session_state.shore_data.copy()
-
-    # HIER ggf. Zahlungsart-Spalte anpassen
-    df_bar = df[df["Zahlungsart"] == "Bar"]
-
-    tagesumsatz = df_bar.groupby("Datum")["Betrag"].sum().reset_index()
-    tagesumsatz = tagesumsatz.sort_values("Datum")
-
-    # Einzahlungen gruppieren
-    if st.session_state.einzahlungen:
-        df_einz = pd.DataFrame(st.session_state.einzahlungen)
-        df_einz_grouped = df_einz.groupby("Datum")["Betrag"].sum().reset_index()
-    else:
-        df_einz_grouped = pd.DataFrame(columns=["Datum", "Betrag"])
-
-    kassenbuch = []
-    bestand = anfangsbestand
-
-    for _, row in tagesumsatz.iterrows():
-        datum = row["Datum"]
-        einnahme = row["Betrag"]
-
-        einzahlung = 0
-        if not df_einz_grouped.empty:
-            match = df_einz_grouped[df_einz_grouped["Datum"] == datum]
-            if not match.empty:
-                einzahlung = match["Betrag"].values[0]
-
-        bestand = bestand + einnahme - einzahlung
-
-        kassenbuch.append({
-            "Datum": datum.strftime("%d.%m.%Y"),
-            "Barumsatz": einnahme,
-            "Einzahlung Bank": einzahlung,
-            "Kassenbestand": bestand
-        })
-
-    df_kassenbuch = pd.DataFrame(kassenbuch)
-
-    df_display = df_kassenbuch.copy()
-    for col in ["Barumsatz", "Einzahlung Bank", "Kassenbestand"]:
-        df_display[col] = df_display[col].map(
-            lambda x: f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+if st.button("Einzahlung Bank hinzufügen"):
+    if b_in > 0:
+        st.session_state["einzahlungen"].append(
+            {"datum": d_in, "betrag": b_in}
         )
 
-    st.dataframe(df_display, use_container_width=True)
+if st.session_state["einzahlungen"]:
+    st.dataframe(pd.DataFrame(st.session_state["einzahlungen"]), use_container_width=True)
 
-    # =====================================================
-    # EXCEL DOWNLOAD
-    # =====================================================
+st.divider()
 
-    excel_buffer = io.BytesIO()
-    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-        df_kassenbuch.to_excel(writer, index=False, sheet_name="Kassenbuch")
+if uploaded:
+    try:
+        days = read_excel_days(uploaded.getvalue())
 
-    st.download_button(
-        "📥 Kassenbuch als Excel herunterladen",
-        data=excel_buffer.getvalue(),
-        file_name="Kassenbuch_Demo.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+        # =============================
+        # DEMO LIMIT
+        # =============================
+        if DEMO_MODE:
+            first_date = days[0][0]
+            demo_end = first_date + timedelta(days=DEMO_DAYS - 1)
+            days = [d for d in days if d[0] <= demo_end]
 
-    # =====================================================
-    # DATEV EXPORT CSV
-    # =====================================================
+        von = days[0][0]
+        bis = days[-1][0]
 
-    datev_export = []
+        st.success(f"Zeitraum: {von.strftime('%d.%m.%Y')} – {bis.strftime('%d.%m.%Y')}")
 
-    for _, row in df_kassenbuch.iterrows():
-        if row["Einzahlung Bank"] > 0:
-            datev_export.append({
-                "Datum": row["Datum"],
-                "Soll": "1200",
-                "Haben": "1000",
-                "Betrag": row["Einzahlung Bank"],
-                "Text": "Einzahlung Bank"
-            })
+        st.header("📄 Downloads")
 
-    df_datev = pd.DataFrame(datev_export)
+        pdf_bytes = build_pdf(
+            von,
+            bis,
+            days,
+            st.session_state["einzahlungen"],
+            startbestand=0.0
+        )
 
-    csv = df_datev.to_csv(index=False, sep=";")
+        csv_bytes = build_datev_csv(
+            days,
+            st.session_state["einzahlungen"]
+        )
 
-    st.download_button(
-        "📤 DATEV CSV herunterladen",
-        data=csv,
-        file_name="DATEV_Export_Demo.csv",
-        mime="text/csv"
-    )
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.download_button(
+                "📥 Kassenbuch PDF herunterladen",
+                data=pdf_bytes,
+                file_name=f"Kassenbuch_{von.year}-{von.month:02d}.pdf"
+            )
+
+        with col2:
+            st.download_button(
+                "📤 DATEV CSV herunterladen",
+                data=csv_bytes,
+                file_name=f"DATEV_{von.year}_{von.month:02d}.csv"
+            )
+
+    except Exception as e:
+        st.error(str(e))
