@@ -6,8 +6,7 @@ import io
 st.set_page_config(page_title="BuchEasy Demo", layout="wide")
 
 st.title("📘 BuchEasy – Demo (7 Tage Version)")
-
-st.warning("⚠️ Demo-Version: Es werden nur die ersten 7 Tage der Shore-Datei angezeigt.")
+st.warning("⚠️ Demo-Version: Es werden nur die ersten 7 Tage der Shore-Datei berücksichtigt.")
 
 # =====================================================
 # SESSION STATE
@@ -16,37 +15,36 @@ st.warning("⚠️ Demo-Version: Es werden nur die ersten 7 Tage der Shore-Datei
 if "shore_data" not in st.session_state:
     st.session_state.shore_data = None
 
-if "start_date_demo" not in st.session_state:
-    st.session_state.start_date_demo = None
-
 if "einzahlungen" not in st.session_state:
     st.session_state.einzahlungen = []
 
 # =====================================================
-# SHORE IMPORT
+# SHORE IMPORT (XLSX)
 # =====================================================
 
-st.header("📥 Shore Export importieren")
+st.header("📥 Shore Export importieren (.xlsx)")
 
-uploaded_file = st.file_uploader("Shore CSV hochladen", type=["csv"])
+uploaded_file = st.file_uploader("Shore XLSX hochladen", type=["xlsx"])
 
 if uploaded_file:
-    df = pd.read_csv(uploaded_file, sep=";", encoding="utf-8")
+    try:
+        df = pd.read_excel(uploaded_file)
 
-    # Datumsspalte anpassen (ggf. an deine Shore Struktur anpassen)
-    df["Datum"] = pd.to_datetime(df["Datum"], dayfirst=True)
+        # WICHTIG:
+        # Falls deine Spalten anders heißen, hier anpassen
+        df["Datum"] = pd.to_datetime(df["Datum"], dayfirst=True)
 
-    # Startdatum für Demo setzen
-    first_date = df["Datum"].min()
-    st.session_state.start_date_demo = first_date
+        first_date = df["Datum"].min()
+        end_date = first_date + timedelta(days=6)
 
-    # Nur 7 Tage anzeigen
-    end_date = first_date + timedelta(days=6)
-    df_demo = df[(df["Datum"] >= first_date) & (df["Datum"] <= end_date)]
+        df_demo = df[(df["Datum"] >= first_date) & (df["Datum"] <= end_date)]
 
-    st.session_state.shore_data = df_demo
+        st.session_state.shore_data = df_demo
 
-    st.success("Shore Datei importiert (7 Tage gefiltert)")
+        st.success("Shore XLSX importiert (7 Tage gefiltert).")
+
+    except Exception as e:
+        st.error(f"Importfehler: {e}")
 
 # =====================================================
 # ANFANGSBESTAND
@@ -54,7 +52,11 @@ if uploaded_file:
 
 st.header("💰 Anfangsbestand Kasse")
 
-anfangsbestand = st.number_input("Anfangsbestand (€)", min_value=0.0, step=0.01)
+anfangsbestand = st.number_input(
+    "Anfangsbestand (€)",
+    min_value=0.0,
+    step=0.01
+)
 
 # =====================================================
 # EINZAHLUNG BANK
@@ -79,7 +81,7 @@ if st.session_state.einzahlungen:
     st.dataframe(df_einzahlung, use_container_width=True)
 
 # =====================================================
-# KASSENBUCH BERECHNUNG
+# KASSENBUCH
 # =====================================================
 
 if st.session_state.shore_data is not None:
@@ -88,7 +90,7 @@ if st.session_state.shore_data is not None:
 
     df = st.session_state.shore_data.copy()
 
-    # Nur Barumsätze (anpassen falls Shore Spalte anders heißt)
+    # HIER ggf. Zahlungsart-Spalte anpassen
     df_bar = df[df["Zahlungsart"] == "Bar"]
 
     tagesumsatz = df_bar.groupby("Datum")["Betrag"].sum().reset_index()
@@ -101,7 +103,6 @@ if st.session_state.shore_data is not None:
     else:
         df_einz_grouped = pd.DataFrame(columns=["Datum", "Betrag"])
 
-    # Kassenbuch erstellen
     kassenbuch = []
     bestand = anfangsbestand
 
@@ -150,7 +151,7 @@ if st.session_state.shore_data is not None:
     )
 
     # =====================================================
-    # DATEV CSV EXPORT
+    # DATEV EXPORT CSV
     # =====================================================
 
     datev_export = []
